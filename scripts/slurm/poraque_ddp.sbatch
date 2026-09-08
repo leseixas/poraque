@@ -13,6 +13,12 @@
 #
 #   sbatch scripts/slurm/poraque_ddp.sbatch configs/train.yaml
 #
+# Build the cache on a CPU node first, so this job starts training the moment
+# it gets its GPUs (scripts/slurm/poraque_cache.sbatch, `--cache-only`):
+#
+#   cache=$(sbatch --parsable scripts/slurm/poraque_cache.sbatch configs/train.yaml)
+#   sbatch --dependency=afterok:${cache} scripts/slurm/poraque_ddp.sbatch configs/train.yaml
+#
 #SBATCH --job-name=poraque-ddp
 #SBATCH --partition=sequana_gpu
 #SBATCH --nodes=1

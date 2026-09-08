@@ -226,6 +226,72 @@ size silently, and offering it would mean a laptop run and a cluster run
 differed in a way nothing recorded.
 ```
 
+(cache-only)=
+### HPC best practices: build the cache on a CPU node first
+
+A training run starts by building its dataset cache — reading every density,
+computing the external potential, spectrally downsampling, writing the result
+under `data.cache` — and none of that touches a GPU. On a cold parallel
+filesystem it is minutes to hours, and inside a GPU allocation it is minutes
+to hours of idle accelerators. So split the run into two jobs:
+
+```bash
+# 1. a CPU-only job: build the cache and exit
+cache=$(sbatch --parsable scripts/slurm/poraque_cache.sbatch configs/train.yaml)
+
+# 2. the multi-GPU job, released when the first succeeds; same config
+sbatch --dependency=afterok:${cache} scripts/slurm/poraque_ddp.sbatch configs/train.yaml
+```
+
+The first script runs
+
+```bash
+poraque-train --config configs/train.yaml --cache-only
+```
+
+which builds the cache exactly as a training run would and then stops —
+before a model, an optimiser, a process group or a training loop exists — with
+exit status 0 and a summary:
+
+```
+==============================================================================
+CACHE BUILT -- no training was run (--cache-only)
+==============================================================================
+  cache       : data/cache/res48_potcar
+  storage     : files (one CHGCAR-format text file per field)
+  materials   : 97 cached  (ext2chg: 97, chg2tau: 97)
+  grid shapes : 24x24x48        11 structures
+                40x28x48        10 structures
+                40x40x48         9 structures
+                48x48x48        64 structures
+                ...
+  elements    : Pt
+  on disk     : 458.9 MiB
+  decoded     : ~134.2 MiB in RAM per task (data.cache_in_memory: True, budget 4.0 GiB)
+```
+
+Three things about the mode are worth knowing:
+
+- **It forces the CPU and forms no group**, whatever the config says.
+  `training.device: cuda`, `strict_device: true` and `distributed: auto` can
+  stay in the file for the GPU job; the CPU job overrides all three for its own
+  process and touches nothing on disk but the cache.
+- **The GPU job rebuilds nothing** as long as its config keeps the cache
+  fingerprint — `data.resolution`, `data.storage`, `data.compression`,
+  `data.spin`, `data.potcar_dir` and the data paths — as it was. Its cache
+  table then reads `cached` on every row and training starts at once. Change
+  one of those keys and the GPU job builds a *different* cache, on the GPU
+  node, which is what the split exists to avoid.
+- **Read the `decoded` line before requesting memory.** It is the size of the
+  fields held in RAM by [`data.cache_in_memory`](cache-in-memory), and the
+  number `auto` compares against its budget; a GPU job whose request is below
+  it either declines the cache (10× slower) or is killed.
+
+One task, not four: the builder is single-process, and several tasks would
+each build the whole cache. Re-running `--cache-only` on a cache that already
+exists is cheap — present materials are left alone — so an interrupted CPU job
+is resubmitted, not restarted.
+
 ## Verifying the installation
 
 ```bash

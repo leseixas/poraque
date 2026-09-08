@@ -112,6 +112,19 @@ and the same *number* of batches, which is what stops DDP's per-`backward()`
 all-reduce from hanging on the rank that ran out first. The effective batch size
 is `batch_size` × the world size, and rank 0 alone prints and writes.
 
+Build the cache before asking for the GPUs. `poraque-train --cache-only`
+builds the dataset cache on the CPU and exits with a summary — no model, no
+process group, no training — so the expensive allocation starts training the
+moment it is granted:
+
+```bash
+cache=$(sbatch --parsable scripts/slurm/poraque_cache.sbatch configs/train.yaml)
+sbatch --dependency=afterok:${cache} scripts/slurm/poraque_ddp.sbatch configs/train.yaml
+```
+
+The GPU job, run with the same config, finds every material `cached` and
+rebuilds nothing.
+
 ### Faster CPU inference (optional)
 
 Poraquê ships a small C kernel for the spectral contraction — the one part of a

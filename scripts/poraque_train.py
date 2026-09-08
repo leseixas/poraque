@@ -405,6 +405,95 @@ def build_cache(config, log):
     return target
 
 
+def cache_disk_bytes(cache):
+    """Bytes on disk under the cache directory, every file counted."""
+    total = 0
+    for root, _, files in os.walk(cache):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                continue
+    return total
+
+
+def report_cache_only(config, cache, log):
+    """
+    The closing summary of a ``--cache-only`` run.
+
+    Printed instead of a training run, so it has to carry what the GPU job
+    that follows would otherwise discover for itself: where the cache is and
+    how it is stored, how many materials it holds and which tasks they can
+    feed, their grid shapes (which is what the shape-bucketed batching sees),
+    what it costs on disk, and what the decoded fields will cost in RAM --
+    the number ``data.cache_in_memory: auto`` is judged against. Read the
+    last one before choosing the GPU job's memory request.
+
+    Parameters
+    ----------
+    config : TrainingConfig
+    cache : str
+        The cache directory :func:`build_cache` returned.
+    log : callable
+    """
+    from poraque.ml.data import discover_materials
+
+    materials = discover_materials(cache, ("CHGCAR",))
+    per_task = {name: len(discover_materials(
+        cache, resolve_task(name).required_files))
+        for name in config.task.names()}
+
+    buckets = {}
+    decoded = 0
+    for name, count in per_task.items():
+        if not count:
+            continue
+        # `cache=False`: this instance exists to be measured and thrown away,
+        # and `auto` would size an in-RAM cache nothing is going to fill.
+        dataset = FieldPairDataset(cache, task=name, cache=False,
+                                   spin=config.data.spin)
+        decoded = max(decoded, dataset.cache_bytes)
+        if not buckets:
+            for shape in dataset.shapes():
+                buckets[tuple(shape)] = buckets.get(tuple(shape), 0) + 1
+
+    storage = config.data.storage
+    if storage == "hdf5":
+        codec = config.data.compression or "uncompressed"
+        if config.data.compression == "gzip":
+            codec += f"-{config.data.compression_level}"
+        storage = f"hdf5 (one fields.h5 per material, {codec})"
+    else:
+        storage = "files (one CHGCAR-format text file per field)"
+
+    log("")
+    log("=" * 78)
+    log("CACHE BUILT -- no training was run (--cache-only)")
+    log("=" * 78)
+    log(f"  cache       : {cache}")
+    log(f"  storage     : {storage}")
+    tasks = ", ".join(f"{name}: {count}" for name, count in per_task.items())
+    log(f"  materials   : {len(materials)} cached  ({tasks})")
+    for index, line in enumerate(format_shapes(buckets, indent=" " * 16)):
+        log(f"  grid shapes : {line}" if index == 0 else line)
+    log(f"  elements    : {', '.join(dataset_elements(cache)) or '--'}")
+    log(f"  on disk     : {format_bytes(cache_disk_bytes(cache))}")
+    if decoded:
+        log(f"  decoded     : ~{format_bytes(decoded)} in RAM per task "
+            f"(data.cache_in_memory: {config.data.cache_in_memory}, "
+            f"budget {format_bytes(CACHE_MEMORY_BUDGET)})")
+    for task in (t for t, n in per_task.items() if not n):
+        log(f"  NOTE: no cached material carries both fields of {task}; the "
+            f"GPU job will skip it.")
+    log("")
+    log("  The GPU job reads this cache and rebuilds nothing, provided its")
+    log("  config keeps data.resolution, data.storage, data.compression,")
+    log("  data.spin and data.potcar_dir as they are here -- those are the")
+    log("  cache fingerprint. Submit it with the same config, e.g.")
+    log("    sbatch scripts/slurm/poraque_ddp.sbatch <config>")
+    log("")
+
+
 def load_paw_reference(cache):
     """The cached per-element PAW table, or an empty dict."""
     from poraque.data.cache import load_paw_reference as _load
@@ -2814,6 +2903,12 @@ def build_parser():
                             "allocation, which is how a scaling run is "
                             "bisected. It cannot create ranks: the launcher "
                             "decides the topology")
+    group.add_argument("--cache-only", action="store_true",
+                       help="Pre-builds the dataset cache on CPU and exits "
+                            "without training. Ideal for HPC job separation: "
+                            "run it in a CPU-only job, then submit the GPU "
+                            "job with the same config, which finds the cache "
+                            "and rebuilds nothing")
     group.add_argument("--cache-in-memory", dest="data.cache_in_memory",
                        default=None,
                        help="auto | true | false -- keep decoded fields in RAM "
@@ -2896,7 +2991,7 @@ def run(argv=None):
     # Flags that steer this function rather than describing a run; they must
     # not be fed to `apply_overrides`, which would look for a config section
     # named after each of them.
-    NOT_SETTINGS = ("config", "no_plots")
+    NOT_SETTINGS = ("config", "no_plots", "cache_only")
 
     config = (TrainingConfig.from_yaml(args.config) if args.config
               else TrainingConfig())
@@ -2912,6 +3007,19 @@ def run(argv=None):
     validate_activation_settings(config)
     validate_equivariance_settings(config)
     validate_physics_settings(config)
+
+    if args.cache_only:
+        # The cache is NumPy work -- parsing, spectral downsampling, writing --
+        # and the point of this mode is to do it where a GPU is not being
+        # billed. So the device is the CPU whatever the config says, and no
+        # process group is formed: `discover_distributed("off")` returns the
+        # disabled context, which is the single-process path with rank 0
+        # writing. Set here, before discovery, so that a `--cache-only` run
+        # launched inside a multi-task allocation by mistake still forms no
+        # group and initialises no NCCL.
+        config.training.device = "cpu"
+        config.training.strict_device = False
+        config.training.distributed = "off"
 
     # Resolved before anything else, because it decides *which* device this
     # process may use and whether it is allowed to write. Never raises: without
@@ -3033,6 +3141,15 @@ def run(argv=None):
         barrier(context)
         if not context.is_main:
             cache = build_cache(config, log)
+
+        if args.cache_only:
+            # Everything a training job needs from the CPU is now on disk.
+            # Stop here -- before a model, an optimiser, a LoRA adapter, a
+            # process group or a training loop exists -- and say what was
+            # built, so the GPU job that follows can be sized against it.
+            report_cache_only(config, cache, log)
+            sys.exit(0)
+
         names = trainable_tasks(config.task.names(), cache, log)
         # One protocol, one variation: K-fold cross-validation.
         driver = run_task_kfold if config.training.enable_kfold else run_task
